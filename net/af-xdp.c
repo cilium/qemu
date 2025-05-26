@@ -21,6 +21,7 @@
 #include "clients.h"
 #include "monitor/monitor.h"
 #include "net/net.h"
+#include "net/tap.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
@@ -54,6 +55,8 @@ typedef struct AFXDPState {
     char                 *map_path;
     uint32_t             map_start_index;
     bool                 inhibit;
+
+    int                  vnet_hdr_len;
 } AFXDPState;
 
 #define AF_XDP_BATCH_SIZE 64
@@ -145,6 +148,10 @@ static ssize_t af_xdp_receive(NetClientState *nc,
                               const uint8_t *buf, size_t size)
 {
     AFXDPState *s = DO_UPCAST(AFXDPState, nc, nc);
+    size_t vlen = sizeof(struct virtio_net_hdr);
+    size_t plen = size - vlen;
+    struct virtio_net_hdr *vhdr = (void *)buf;
+    struct xsk_tx_metadata *meta;
     struct xdp_desc *desc;
     uint32_t idx;
     void *data;
@@ -152,9 +159,9 @@ static ssize_t af_xdp_receive(NetClientState *nc,
     /* Try to recover buffers that are already sent. */
     af_xdp_complete_tx(s);
 
-    if (size > XSK_UMEM__DEFAULT_FRAME_SIZE) {
+    if (plen > XSK_UMEM__DEFAULT_FRAME_SIZE) {
         /* We can't transmit packet this size... */
-        return size;
+        return plen;
     }
 
     if (!s->n_pool || !xsk_ring_prod__reserve(&s->tx, 1, &idx)) {
@@ -168,10 +175,17 @@ static ssize_t af_xdp_receive(NetClientState *nc,
 
     desc = xsk_ring_prod__tx_desc(&s->tx, idx);
     desc->addr = s->pool[--s->n_pool];
-    desc->len = size;
+    desc->options |= XDP_TX_METADATA;
+    desc->len = plen;
 
     data = xsk_umem__get_data(s->buffer, desc->addr);
-    memcpy(data, buf, size);
+    meta = data - sizeof(struct xsk_tx_metadata);
+    memset(meta, 0, sizeof(*meta));
+    /* XXX: needs check VIRTIO_NET_HDR_F_NEEDS_CSUM */
+    meta->request.csum_start = vhdr->csum_start;
+    meta->request.csum_offset = vhdr->csum_offset;
+    meta->flags |= XDP_TXMD_FLAGS_CHECKSUM;
+    memcpy(data, buf + vlen, plen);
 
     xsk_ring_prod__submit(&s->tx, 1);
     s->outstanding_tx++;
@@ -259,6 +273,35 @@ static void af_xdp_send(void *opaque)
     af_xdp_fq_refill(s, AF_XDP_BATCH_SIZE);
 }
 
+static bool af_xdp_has_vnet_hdr_len(NetClientState *nc, int len)
+{
+    //AFXDPState *s = DO_UPCAST(AFXDPState, nc, nc);
+
+    return true;
+}
+
+static bool af_xdp_has_vnet_hdr(NetClientState *nc)
+{
+    return af_xdp_has_vnet_hdr_len(nc, sizeof(struct virtio_net_hdr));
+}
+
+static void af_xdp_set_vnet_hdr_len(NetClientState *nc, int len)
+{
+    AFXDPState *s = DO_UPCAST(AFXDPState, nc, nc);
+
+    s->vnet_hdr_len = len;
+}
+
+static void af_xdp_set_offload(NetClientState *nc, int csum, int tso4, int tso6,
+                               int ecn, int ufo, int uso4, int uso6)
+{
+    AFXDPState *s = DO_UPCAST(AFXDPState, nc, nc);
+
+    if (!s->vnet_hdr_len) {
+        af_xdp_set_vnet_hdr_len(nc, sizeof(struct virtio_net_hdr));
+    }
+}
+
 /* Flush and close. */
 static void af_xdp_cleanup(NetClientState *nc)
 {
@@ -309,7 +352,8 @@ static int af_xdp_umem_create(AFXDPState *s, int sock_fd, Error **errp)
         .fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS,
         .comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
         .frame_size = XSK_UMEM__DEFAULT_FRAME_SIZE,
-        .frame_headroom = 0,
+        .flags = XDP_UMEM_UNALIGNED_CHUNK_FLAG | XDP_UMEM_TX_METADATA_LEN,
+        .tx_metadata_len = sizeof(struct xsk_tx_metadata),
     };
     uint64_t n_descs;
     uint64_t size;
@@ -439,6 +483,11 @@ static NetClientInfo net_af_xdp_info = {
     .receive = af_xdp_receive,
     .poll = af_xdp_poll,
     .cleanup = af_xdp_cleanup,
+    .has_ufo = af_xdp_has_vnet_hdr,
+    .has_vnet_hdr = af_xdp_has_vnet_hdr,
+    .has_vnet_hdr_len = af_xdp_has_vnet_hdr_len,
+    .set_offload = af_xdp_set_offload,
+    .set_vnet_hdr_len = af_xdp_set_vnet_hdr_len,
 };
 
 static int *parse_socket_fds(const char *sock_fds_str,
@@ -531,6 +580,7 @@ int net_init_af_xdp(const Netdev *netdev,
         pstrcpy(s->ifname, sizeof(s->ifname), opts->ifname);
         s->ifindex = ifindex;
         s->n_queues = queues;
+        s->vnet_hdr_len = 0;
         if (opts->map_path) {
             s->map_path = g_strdup(opts->map_path);
             if (opts->has_map_start_index && opts->map_start_index > 0) {
