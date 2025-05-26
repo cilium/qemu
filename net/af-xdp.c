@@ -21,6 +21,7 @@
 #include "clients.h"
 #include "monitor/monitor.h"
 #include "net/net.h"
+#include "net/tap.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
@@ -50,8 +51,10 @@ typedef struct AFXDPState {
     struct xsk_umem      *umem;
 
     uint32_t             n_queues;
+    bool                 csum_offload_tx;
     uint32_t             xdp_flags;
     bool                 inhibit;
+    int                  vnet_hdr_len;
 
     char                 *map_path;
     int                  map_fd;
@@ -147,6 +150,10 @@ static ssize_t af_xdp_receive(NetClientState *nc,
                               const uint8_t *buf, size_t size)
 {
     AFXDPState *s = DO_UPCAST(AFXDPState, nc, nc);
+    const size_t vlen = sizeof(struct virtio_net_hdr);
+    size_t plen = size - vlen;
+    struct virtio_net_hdr *vhdr = (void *)buf;
+    struct xsk_tx_metadata *meta;
     struct xdp_desc *desc;
     uint32_t idx;
     void *data;
@@ -154,9 +161,9 @@ static ssize_t af_xdp_receive(NetClientState *nc,
     /* Try to recover buffers that are already sent. */
     af_xdp_complete_tx(s);
 
-    if (size > XSK_UMEM__DEFAULT_FRAME_SIZE) {
+    if (plen > XSK_UMEM__DEFAULT_FRAME_SIZE) {
         /* We can't transmit packet this size... */
-        return size;
+        return plen;
     }
 
     if (!s->n_pool || !xsk_ring_prod__reserve(&s->tx, 1, &idx)) {
@@ -170,10 +177,18 @@ static ssize_t af_xdp_receive(NetClientState *nc,
 
     desc = xsk_ring_prod__tx_desc(&s->tx, idx);
     desc->addr = s->pool[--s->n_pool];
-    desc->len = size;
+    desc->len = plen;
 
     data = xsk_umem__get_data(s->buffer, desc->addr);
-    memcpy(data, buf, size);
+    meta = data - sizeof(struct xsk_tx_metadata);
+    memset(meta, 0, sizeof(*meta));
+    if (s->csum_offload_tx && (vhdr->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM)) {
+        desc->options |= XDP_TX_METADATA;
+        meta->flags |= XDP_TXMD_FLAGS_CHECKSUM;
+        meta->request.csum_start = vhdr->csum_start;
+        meta->request.csum_offset = vhdr->csum_offset;
+    }
+    memcpy(data, buf + vlen, plen);
 
     xsk_ring_prod__submit(&s->tx, 1);
     s->outstanding_tx++;
@@ -183,6 +198,27 @@ static ssize_t af_xdp_receive(NetClientState *nc,
     }
 
     return size;
+}
+
+static bool af_xdp_has_vnet_hdr(NetClientState *nc)
+{
+    return true;
+}
+
+static bool af_xdp_has_vnet_hdr_len(NetClientState *nc, int len)
+{
+    return len == sizeof(struct virtio_net_hdr);
+}
+
+static void af_xdp_set_offload(NetClientState *nc, int csum, int tso4, int tso6,
+                               int ecn, int ufo, int uso4, int uso6)
+{
+    AFXDPState *s = DO_UPCAST(AFXDPState, nc, nc);
+
+    s->csum_offload_tx = !!csum;
+    if (tso4 || tso6 || ecn || ufo || uso4 || uso6) {
+        warn_report("af-xdp: TSO/UFO/USO offload not supported yet by backend");
+    }
 }
 
 /*
@@ -222,6 +258,7 @@ static void af_xdp_fq_refill(AFXDPState *s, uint32_t n)
 
 static void af_xdp_send(void *opaque)
 {
+    const size_t vlen = sizeof(struct virtio_net_hdr);
     uint32_t i, n_rx, idx = 0;
     AFXDPState *s = opaque;
 
@@ -231,13 +268,20 @@ static void af_xdp_send(void *opaque)
     }
 
     for (i = 0; i < n_rx; i++) {
+        struct virtio_net_hdr *vhdr;
         const struct xdp_desc *desc;
         struct iovec iov;
 
         desc = xsk_ring_cons__rx_desc(&s->rx, idx++);
 
         iov.iov_base = xsk_umem__get_data(s->buffer, desc->addr);
-        iov.iov_len = desc->len;
+        iov.iov_base -= vlen;
+        iov.iov_len = desc->len + vlen;
+
+        vhdr = iov.iov_base;
+        memset(vhdr, 0, sizeof(*vhdr));
+        /* TODO: AF_XDP support to pass csum offload along. */
+        vhdr->flags |= VIRTIO_NET_HDR_F_DATA_VALID;
 
         s->pool[s->n_pool++] = desc->addr;
 
@@ -307,7 +351,8 @@ static int af_xdp_umem_create(AFXDPState *s, int sock_fd, Error **errp)
         .fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS,
         .comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
         .frame_size = XSK_UMEM__DEFAULT_FRAME_SIZE,
-        .frame_headroom = 0,
+        .flags = XDP_UMEM_TX_METADATA_LEN,
+        .tx_metadata_len = sizeof(struct xsk_tx_metadata),
     };
     uint64_t n_descs;
     uint64_t size;
@@ -447,6 +492,9 @@ static NetClientInfo net_af_xdp_info = {
     .receive = af_xdp_receive,
     .poll = af_xdp_poll,
     .cleanup = af_xdp_cleanup,
+    .has_vnet_hdr = af_xdp_has_vnet_hdr,
+    .has_vnet_hdr_len = af_xdp_has_vnet_hdr_len,
+    .set_offload = af_xdp_set_offload,
 };
 
 static int *parse_socket_fds(const char *sock_fds_str,
@@ -549,7 +597,7 @@ int net_init_af_xdp(const Netdev *netdev,
         pstrcpy(s->ifname, sizeof(s->ifname), opts->ifname);
         s->ifindex = ifindex;
         s->n_queues = queues;
-
+        s->vnet_hdr_len = 0;
         s->inhibit = inhibit;
 
         s->map_path = g_strdup(opts->map_path);
